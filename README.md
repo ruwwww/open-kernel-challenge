@@ -14,7 +14,7 @@ Evaluated under strict CUDA Graphs with cold L2 cache enforcement against SGLang
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`muse_attention_decode`** | 3,766.3 µs | **1,446.8 µs** | **`2.6032x`** | **Rank #69** 🏆 | `2827c6e61a784868` | **PASSED** (16/16) |
 | **`muse_moe_w4a16`** | 13,448.5 µs | **5,754.6 µs** | **`2.3370x`** | **Rank #85** 🏆 | `3ed21907cbff49be` | **PASSED** (5/5) |
-| **`muse_prefill_layer`** | 387,403.9 µs | **217,625.5 µs** | **`1.7801x`** | **Rank #91** 🏆 | `466e2943491845bf` | **PASSED** (5/5) |
+| **`muse_prefill_layer`** | 387,403.9 µs | **215,829.3 µs** | **`1.7950x`** | **Rank #69** 🏆 | `0ceef6beb3f24141` | **PASSED** (5/5) |
 | **`muse_decode_layer`** | 22,620.3 µs | **10,901.0 µs** | **`2.0751x`** | **Rank #148** 🏆 | `f60b136cfdc242cb` | **PASSED** (13/13) |
 | **`muse_bf16_proj`** | 4,830.8 µs | **3,208.6 µs** | **`1.5056x`** | **Rank #206** 🏆 | `c512f73af0454fa2` | **PASSED** (9/9) |
 
@@ -36,12 +36,16 @@ Evaluated under strict CUDA Graphs with cold L2 cache enforcement against SGLang
 - **Dynamic Dual Work Queues:** Experts are partitioned into heavy (fat) jobs (streamed along $K$) and skinny jobs (16 rows with split-K warps), dynamically dequeued via atomic counters (`atom.inc`).
 - **Key Metric:** Decode 1 latency drops to **24.8 µs (3.102x)**; Verify 32 drops to **220.2 µs (2.845x)**.
 
-### 3. `muse_prefill_layer` (1.7801x Speedup — Rank #91)
+### 3. `muse_prefill_layer` (1.7950x Speedup — Rank #69)
+- **Explicit cuBLASLt Signature Pinning (14 GEMMs):** Completely eliminates prepare-time tuning jitter by directly locking all dense GEMM configurations ($T \in \{753, 3012, 16384\}$) to optimal `nvjet_sm90` heuristic descriptors. Cuts QKV 16K latency to 776.7 µs and Router 16K to 189.9 µs.
+- **Direct Streaming Residual Boundary:** Operates residual accumulation without recompute loops at $T=16384$, keeping 100% active register allocation with zero local memory spills.
 - **Dual-Engine Attention Selection:** Dynamically chooses between tuned FA3 paged FP8 attention and a specialized Hopper attention Megakernel (`attn_fwd_kernel`) based on context length and layer type (sliding window vs full attention).
 - **Multi-Stream Producer-Consumer Overlap:** Concurrently executes router linear projection and top-k expert selection on a secondary CUDA stream while pooler GEMM and pre-expert normalization run on the main stream, joining via `cudaStreamWaitEvent`.
 - **Fused Boundary Kernels (`boundary_kernel`):** Integrates RMSNorm, residual stream mixing (`alpha * stream + beta * rms(branch)`), and MoE work-counter resets in a single contiguous memory pass.
 
-### 4. `muse_decode_layer` (2.0021x Speedup — Rank #167)
+### 4. `muse_decode_layer` (2.0751x Speedup — Rank #148)
+- **Fused Skinny Swap-AB & Compressed Weights:** Projections for small tokens ($T \le 32$) utilize 12-bit losslessly compressed weights and register-based GEMV, avoiding Triton launch bubbles.
+- **Fused Dual-Output Pooler & Router:** Computes Pooler BF16 and Router FP32 concurrently in a single kernel launch sharing SMEM activation loads.
 - **End-to-End Layer Megakernel Pipeline:** Unifies the full transformer decode step:
   $$\text{Input} \to \text{QKV Proj} \to \text{Gated Attn Megakernel} \to \text{O Proj} \to \text{Boundary 1} \to \text{Pooler/Router} \to \text{MoE Persistent Megakernel} \to \text{Unpooler} \to \text{Boundary 2}$$
 - Eliminates CPU launch overhead and device-wide synchronization barriers between attention and MoE blocks under CUDA Graph execution.
@@ -70,15 +74,15 @@ Evaluated under strict CUDA Graphs with cold L2 cache enforcement against SGLang
 │   ├── submission.py
 │   ├── TASK.md
 │   └── profiles/
-├── muse_prefill_layer/    # Rank #91 (1.7801x) - Full Prefill Layer Megakernel
+├── muse_prefill_layer/    # Rank #69 (1.7950x) - Full Prefill Layer Megakernel
 │   ├── submission.py
 │   ├── TASK.md
 │   └── profiles/
-├── muse_decode_layer/     # Rank #167 (2.0021x) - Full Decode Layer Megakernel
+├── muse_decode_layer/     # Rank #148 (2.0751x) - Full Decode Layer Megakernel
 │   ├── submission.py
 │   ├── TASK.md
 │   └── profiles/
-├── muse_bf16_proj/        # Rank #216 (1.5000x) - Skinny Swap-AB & 12-bit Weight GEMV
+├── muse_bf16_proj/        # Rank #206 (1.5056x) - Skinny Swap-AB & 12-bit Weight GEMV
 │   ├── submission.py
 │   ├── TASK.md
 │   └── profiles/
