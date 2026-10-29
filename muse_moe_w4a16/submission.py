@@ -624,7 +624,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
         SMB: gl.constexpr = False, HOP: gl.constexpr = False,
               CHK: gl.constexpr = False, PF: gl.constexpr = False,
               DIRECT: gl.constexpr = False, NLOC: gl.constexpr = 32, GU: gl.constexpr = False,
-        IL: gl.constexpr = False):
+        IL: gl.constexpr = False, KS: gl.constexpr = 1):
     mma: gl.constexpr = (MMA3_8 if BM == 8 else MMA3_16) if HOP else MMA_L
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
     pid_n = gl.program_id(0)
@@ -666,7 +666,11 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
         if PF:
             wq_n = gl.load(wp + w_off)
             sq_n = gl.load(sf_ptr + s_off)
-        for k0 in range(0, K, BK):
+        if KS > 1:
+            k_lo = gl.program_id(2) * (K // KS)
+        else:
+            k_lo = 0
+        for k0 in range(k_lo, k_lo + K // KS, BK):
             if PF:
                 wq = wq_n
                 sq = sq_n
@@ -713,6 +717,9 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
             v = (hg / (1.0 + gl.exp(-hg))).to(gl.bfloat16).to(gl.float32) * hu
             col = pid_n * (BN // 2) + (rg // 16) * 8 + rg % 8
             gl.store(out_ptr + pg * (N // 2) + col, v.to(gl.bfloat16), mask=mg != 0)
+        elif KS > 1:  # FP32 partial row [pair, split, N]
+            optr = out_ptr + gl.expand_dims(pair_o, 0) * (KS * N) + gl.program_id(2) * N + gl.expand_dims(n0 + n_o, 1)
+            gl.store(optr, y, mask=gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1))
         else:
             optr = out_ptr + gl.expand_dims(pair_o, 0) * N + gl.expand_dims(n0 + n_o, 1)
             gl.store(optr, y.to(gl.bfloat16), mask=gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1))
@@ -721,6 +728,92 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
             zl: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[32], warps_per_cta=[4], order=[0])
             zo = gl.arange(0, BN, layout=zl)
             gl.store(out_ptr + pid_w * N + pid_n * BN + zo, gl.zeros([BN], gl.bfloat16, layout=zl))
+
+
+
+FG1R1_BH = 512
+FG1R1_TS = {8, 16, 32, 128}
+W2_KS = 2
+W2_KS_M = (8, 16, 32)
+
+
+@triton.jit
+def _pe_rstd_kernel(x_ptr, w_ptr, r_ptr, ids_ptr, TOPK: tl.constexpr, H: tl.constexpr, eps, BLOCK_H: tl.constexpr,
+                    KS: tl.constexpr = 1):
+    tok = tl.program_id(0)
+    k = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+    if tl.load(ids_ptr + tok * TOPK + k) >= 0:
+        w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        base = (tok * TOPK + k) * H
+        if KS > 1:
+            x = tl.zeros([BLOCK_H], dtype=tl.float32)
+            for s in tl.static_range(KS):
+                x += tl.load(x_ptr + base * KS + s * H + offs, mask=mask, other=0.0)
+            x = x.to(tl.bfloat16).to(tl.float32)
+        else:
+            x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        y = x * w
+        var = tl.sum(y * y, axis=0) / H
+        tl.store(r_ptr + tok * TOPK + k, tl.rsqrt(var + eps))
+
+
+@triton.jit
+def _pe_combine_kernel(x_ptr, w_ptr, s_ptr, r_ptr, out_ptr, ids_ptr, TOPK: tl.constexpr, H: tl.constexpr,
+                       BH: tl.constexpr, KS: tl.constexpr = 1):
+    tok = tl.program_id(0)
+    offs = tl.program_id(1) * BH + tl.arange(0, BH)
+    w = tl.load(w_ptr + offs).to(tl.float32)
+    acc = tl.zeros([BH], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        base = (tok * TOPK + k) * H
+        if tl.load(ids_ptr + tok * TOPK + k) >= 0:
+            if KS > 1:
+                x = tl.zeros([BH], dtype=tl.float32)
+                for s in tl.static_range(KS):
+                    x += tl.load(x_ptr + base * KS + s * H + offs)
+                x = x.to(tl.bfloat16).to(tl.float32)
+            else:
+                x = tl.load(x_ptr + base + offs).to(tl.float32)
+            y = x * w
+            y = y * tl.load(r_ptr + tok * TOPK + k)
+            s = tl.load(s_ptr + tok * TOPK + k).to(tl.float32)
+            acc += y * s
+    tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty))
+
+
+def _fg1r1(y, topk_weights, norm_weight, local_ids, out, tokens, topk, hidden, ks):
+    r = torch.empty((tokens * topk,), dtype=torch.float32, device=out.device)
+    _pe_rstd_kernel[(tokens, topk)](y, norm_weight, r, local_ids, TOPK=topk, H=hidden, eps=POST_NORM_EPS,
+                                    BLOCK_H=triton.next_power_of_2(hidden), KS=ks, num_warps=8, num_stages=2)
+    _pe_combine_kernel[(tokens, hidden // FG1R1_BH)](y, norm_weight, topk_weights, r, out, local_ids, TOPK=topk,
+                                                     H=hidden, BH=FG1R1_BH, KS=ks, num_warps=4)
+    return out
+
+
+def _post_expert_weighted_sum(y, topk_weights, norm_weight, local_ids):
+    tokens, topk, hidden = y.shape
+    out = torch.empty((tokens, hidden), dtype=y.dtype, device=y.device)
+    if FG1R1_TS is None or tokens in FG1R1_TS:
+        return _fg1r1(y, topk_weights, norm_weight, local_ids, out, tokens, topk, hidden, 1)
+    block_h = triton.next_power_of_2(hidden)
+    _post_expert_norm_weighted_sum_kernel[(tokens,)](
+        y, norm_weight, topk_weights, out, local_ids, TOPK=topk, H=hidden, eps=POST_NORM_EPS,
+        APPLY_NORM=True, HAS_WEIGHT=True, WEIGHT_FIRST=True, HAS_IDS=True, BLOCK_H=block_h,
+        num_warps=8 if block_h >= 4096 else 4, num_stages=2)
+    return out
+
+
+def _post_expert_weighted_sum_ks(y, topk_weights, norm_weight, local_ids, ks):
+    tokens, topk = local_ids.shape
+    hidden = y.shape[-1]
+    out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=y.device)
+    if FG1R1_TS is None or tokens in FG1R1_TS:
+        return _fg1r1(y, topk_weights, norm_weight, local_ids, out, tokens, topk, hidden, ks)
+    block_h = triton.next_power_of_2(hidden)
+    # fallback
+    return _fg1r1(y, topk_weights, norm_weight, local_ids, out, tokens, topk, hidden, ks)
 
 
 # ---- split-K W2 at decode 1 ----
@@ -1182,23 +1275,24 @@ def kernel_fn(data, state):
                                      K=H, I=I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
                                      HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
                                      IL=il, num_warps=NUM_WARPS, **_w13_regcap(M))
-    y = torch.empty((P, H), dtype=torch.bfloat16, device=dev)
     if M >= MIX_MIN_M and not W2_VERIFY_C175:  # W2 on the register path with the per-item tile
+        y = torch.empty((P, H), dtype=torch.bfloat16, device=dev)
         smb2 = VERIFY_SMB and M >= SMB_MIN_M
         _w2_mix[(H // BN, grid_w)](inter, state["w2"], state["w2_sf"], state["w2_gs"], sorted_pairs, work, nwork, y,
                                    K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=smb2,
                                    HOP=state["hopper"] and smb2, CHK=True, PF=M <= PF_MAX_M, num_warps=NUM_WARPS)
-    else:
-        _w2[(H // BN, grid_w)](inter, w2c, w2s, state["w2_gs"], sorted_pairs, work, nwork, y,
-                               K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
-                               HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
-                               IL=il, num_warps=NUM_WARPS)
-    out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
-    block_h = triton.next_power_of_2(H)
-    _post_expert_norm_weighted_sum_kernel[(M,)](
-        y, state["norm_w"], tw, out, local, TOPK=TOP_K, H=H, eps=POST_NORM_EPS,
-        APPLY_NORM=True, HAS_WEIGHT=True, WEIGHT_FIRST=True, HAS_IDS=True, BLOCK_H=block_h,
-        num_warps=8 if block_h >= 4096 else 4, num_stages=2)
-    return out
+        return _post_expert_weighted_sum(y.view(M, TOP_K, H), tw, state["norm_w"], local)
+    if M in W2_KS_M:
+        y = torch.empty((P, W2_KS, H), dtype=torch.float32, device=dev)
+        _w2[(H // BN, grid_w, W2_KS)](inter, w2c, w2s, state["w2_gs"], sorted_pairs, work, nwork, y,
+                                     K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
+                                     CHK=True, PF=False, IL=il, KS=W2_KS, num_warps=NUM_WARPS)
+        return _post_expert_weighted_sum_ks(y, tw, state["norm_w"], local, W2_KS)
+    y = torch.empty((P, H), dtype=torch.bfloat16, device=dev)
+    _w2[(H // BN, grid_w)](inter, w2c, w2s, state["w2_gs"], sorted_pairs, work, nwork, y,
+                           K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
+                           HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
+                           IL=il, num_warps=NUM_WARPS)
+    return _post_expert_weighted_sum(y.view(M, TOP_K, H), tw, state["norm_w"], local)
 
 
