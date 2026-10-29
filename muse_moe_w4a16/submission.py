@@ -196,6 +196,71 @@ def _route2(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, nwor
     tl.store(nwork2_ptr, total2)
 
 
+
+@triton.jit
+def _route2_mc(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, nwork2_ptr, P, local_start,
+               LOCAL: tl.constexpr, BM: tl.constexpr, BM2: tl.constexpr, P_BLOCK: tl.constexpr, W_MAX: tl.constexpr,
+               W_MAX2: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, P_BLOCK)
+    pm = offs < P
+    gid = tl.load(ids_ptr + offs, mask=pm, other=-1)
+    lid = gid - local_start
+    live = pm & (lid >= 0) & (lid < LOCAL)
+    lid = tl.where(live, lid, -1)
+    if pid < LOCAL:
+        start = tl.sum((live & (lid < pid)).to(tl.int32), 0)
+        mine = live & (lid == pid)
+        rank = tl.cumsum(mine.to(tl.int32), 0) - 1
+        tl.store(sorted_ptr + start + rank, offs, mask=mine)
+    elif pid == LOCAL:
+        dead = pm & (live == 0)
+        n_live = tl.sum(live.to(tl.int32), 0)
+        rank = tl.cumsum(dead.to(tl.int32), 0) - 1
+        tl.store(sorted_ptr + n_live + rank, offs, mask=dead)
+    elif pid == LOCAL + 1:
+        tl.store(local_ptr + offs, lid, mask=pm)
+        counts = tl.histogram(tl.maximum(lid, 0), LOCAL, mask=live)
+        starts = tl.cumsum(counts, 0) - counts
+        e_ar = tl.arange(0, LOCAL)
+        chunks = (counts + BM - 1) // BM
+        coff = tl.cumsum(chunks, 0) - chunks
+        total = tl.sum(chunks, 0)
+        w = tl.arange(0, W_MAX)
+        sel = (coff[None, :] <= w[:, None]) & ((coff + chunks)[None, :] > w[:, None])
+        owner = tl.sum(tl.where(sel, e_ar[None, :], 0), 1)
+        c_first = tl.sum(tl.where(sel, coff[None, :], 0), 1)
+        e_start = tl.sum(tl.where(sel, starts[None, :], 0), 1)
+        e_cnt = tl.sum(tl.where(sel, counts[None, :], 0), 1)
+        r0 = e_start + (w - c_first) * BM
+        r1 = tl.minimum(r0 + BM, e_start + e_cnt)
+        wm = w < total
+        tl.store(work_ptr + w * 3 + 0, owner, mask=wm)
+        tl.store(work_ptr + w * 3 + 1, r0, mask=wm)
+        tl.store(work_ptr + w * 3 + 2, r1, mask=wm)
+        tl.store(nwork_ptr, total)
+    else:
+        counts = tl.histogram(tl.maximum(lid, 0), LOCAL, mask=live)
+        starts = tl.cumsum(counts, 0) - counts
+        e_ar = tl.arange(0, LOCAL)
+        chunks2 = (counts + BM2 - 1) // BM2
+        coff2 = tl.cumsum(chunks2, 0) - chunks2
+        total2 = tl.sum(chunks2, 0)
+        w2 = tl.arange(0, W_MAX2)
+        sel2 = (coff2[None, :] <= w2[:, None]) & ((coff2 + chunks2)[None, :] > w2[:, None])
+        owner2 = tl.sum(tl.where(sel2, e_ar[None, :], 0), 1)
+        c_first2 = tl.sum(tl.where(sel2, coff2[None, :], 0), 1)
+        e_start2 = tl.sum(tl.where(sel2, starts[None, :], 0), 1)
+        e_cnt2 = tl.sum(tl.where(sel2, counts[None, :], 0), 1)
+        q0 = e_start2 + (w2 - c_first2) * BM2
+        q1 = tl.minimum(q0 + BM2, e_start2 + e_cnt2)
+        wm2 = w2 < total2
+        tl.store(work2_ptr + w2 * 3 + 0, owner2, mask=wm2)
+        tl.store(work2_ptr + w2 * 3 + 1, q0, mask=wm2)
+        tl.store(work2_ptr + w2 * 3 + 2, q1, mask=wm2)
+        tl.store(nwork2_ptr, total2)
+
+
 _DECODE_ASM = gl.constexpr("""
 {
 .reg .b32 t, u;
@@ -1086,13 +1151,15 @@ def kernel_fn(data, state):
     sorted_pairs = torch.empty((P,), dtype=torch.int32, device=dev)
     work = torch.empty((w_max, 3), dtype=torch.int32, device=dev)
     nwork = torch.empty((1,), dtype=torch.int32, device=dev)
+    grid_w = triton.cdiv(P, bm) + L
     if M >= MIX_MIN_M:  # one routing pass, two work lists (W2's 16-row items, W13's BM_W13-row items)
         bm13 = BM_W13
-        w_max13 = triton.next_power_of_2(triton.cdiv(P, bm13) + L)
+        grid_w13 = triton.cdiv(P, bm13) + L
+        w_max13 = triton.next_power_of_2(grid_w13)
         work13 = torch.empty((w_max13, 3), dtype=torch.int32, device=dev)
         nwork13 = torch.empty((1,), dtype=torch.int32, device=dev)
-        _route2[(1,)](ids, local, sorted_pairs, work, nwork, work13, nwork13, P, ls, LOCAL=L, BM=bm, BM2=bm13,
-                      P_BLOCK=p_block, W_MAX=w_max, W_MAX2=w_max13, num_warps=16 if p_block >= 1024 else 4)
+        _route2_mc[(L + 3,)](ids, local, sorted_pairs, work, nwork, work13, nwork13, P, ls, LOCAL=L, BM=bm, BM2=bm13,
+                             P_BLOCK=p_block, W_MAX=w_max, W_MAX2=w_max13, num_warps=16 if p_block >= 1024 else 4)
     else:
         _route[(1,)](ids, local, sorted_pairs, work, nwork, P, ls, LOCAL=L, BM=bm, P_BLOCK=p_block, W_MAX=w_max,
                      num_warps=16 if p_block >= 1024 else 4)
@@ -1101,31 +1168,31 @@ def kernel_fn(data, state):
     w13c, w13s = state["il13"] if il else (state["w13"], state["w13_sf"])
     w2c, w2s = state["il2"] if il else (state["w2"], state["w2_sf"])
     if M in GU_M:  # gate/up-paired W13 at these token counts
-        _w2[(2 * I // BN, w_max)](x, state["w13g"], state["w13g_sf"], state["w13_gs"], sorted_pairs, work, nwork,
-                                  inter, K=H, N=2 * I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
-                                  CHK=True, PF=M <= PF_MAX_M, GU=True, num_warps=NUM_WARPS)
+        _w2[(2 * I // BN, grid_w)](x, state["w13g"], state["w13g_sf"], state["w13_gs"], sorted_pairs, work, nwork,
+                                   inter, K=H, N=2 * I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
+                                   CHK=True, PF=M <= PF_MAX_M, GU=True, num_warps=NUM_WARPS)
     elif M >= MIX_MIN_M:  # W13 on 32-row items, per-item tile, register path
         smb = VERIFY_SMB and M >= SMB_MIN_M
-        _w13_mix[(I // BN, w_max13)](x, state["w13"], state["w13_sf"], state["w13_gs"], sorted_pairs, work13, nwork13,
-                                     inter, K=H, I=I, BN=BN, BK=BK, BM=bm13, XS=M >= XS_MIN_M, SMB=smb,
-                                     HOP=state["hopper"] and smb, CHK=True, PF=M <= PF_MAX_M,
-                                     num_warps=NUM_WARPS, **_w13_regcap(M))
+        _w13_mix[(I // BN, grid_w13)](x, state["w13"], state["w13_sf"], state["w13_gs"], sorted_pairs, work13, nwork13,
+                                      inter, K=H, I=I, BN=BN, BK=BK, BM=bm13, XS=M >= XS_MIN_M, SMB=smb,
+                                      HOP=state["hopper"] and smb, CHK=True, PF=M <= PF_MAX_M,
+                                      num_warps=NUM_WARPS, **_w13_regcap(M))
     else:
-        _w13_silu[(I // BN, w_max)](x, w13c, w13s, state["w13_gs"], sorted_pairs, work, nwork, inter,
-                                    K=H, I=I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
-                                    HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
-                                    IL=il, num_warps=NUM_WARPS, **_w13_regcap(M))
+        _w13_silu[(I // BN, grid_w)](x, w13c, w13s, state["w13_gs"], sorted_pairs, work, nwork, inter,
+                                     K=H, I=I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
+                                     HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
+                                     IL=il, num_warps=NUM_WARPS, **_w13_regcap(M))
     y = torch.empty((P, H), dtype=torch.bfloat16, device=dev)
     if M >= MIX_MIN_M and not W2_VERIFY_C175:  # W2 on the register path with the per-item tile
         smb2 = VERIFY_SMB and M >= SMB_MIN_M
-        _w2_mix[(H // BN, w_max)](inter, state["w2"], state["w2_sf"], state["w2_gs"], sorted_pairs, work, nwork, y,
-                                  K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=smb2,
-                                  HOP=state["hopper"] and smb2, CHK=True, PF=M <= PF_MAX_M, num_warps=NUM_WARPS)
+        _w2_mix[(H // BN, grid_w)](inter, state["w2"], state["w2_sf"], state["w2_gs"], sorted_pairs, work, nwork, y,
+                                   K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=smb2,
+                                   HOP=state["hopper"] and smb2, CHK=True, PF=M <= PF_MAX_M, num_warps=NUM_WARPS)
     else:
-        _w2[(H // BN, w_max)](inter, w2c, w2s, state["w2_gs"], sorted_pairs, work, nwork, y,
-                              K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
-                              HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
-                              IL=il, num_warps=NUM_WARPS)
+        _w2[(H // BN, grid_w)](inter, w2c, w2s, state["w2_gs"], sorted_pairs, work, nwork, y,
+                               K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=M >= SMB_MIN_M,
+                               HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
+                               IL=il, num_warps=NUM_WARPS)
     out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
     block_h = triton.next_power_of_2(H)
     _post_expert_norm_weighted_sum_kernel[(M,)](
