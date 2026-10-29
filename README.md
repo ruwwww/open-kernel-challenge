@@ -16,7 +16,7 @@ Evaluated under strict CUDA Graphs with cold L2 cache enforcement against SGLang
 | **`muse_moe_w4a16`** | 13,448.5 µs | **5,754.6 µs** | **`2.3370x`** | **Rank #85** 🏆 | `3ed21907cbff49be` | **PASSED** (5/5) |
 | **`muse_prefill_layer`** | 387,403.9 µs | **217,625.5 µs** | **`1.7801x`** | **Rank #91** 🏆 | `466e2943491845bf` | **PASSED** (5/5) |
 | **`muse_decode_layer`** | 22,620.3 µs | **11,298.5 µs** | **`2.0021x`** | **Rank #167** 🏆 | `5e7cbd571cc54e31` | **PASSED** (13/13) |
-| **`muse_bf16_proj`** | 4,830.8 µs | **3,220.7 µs** | **`1.5000x`** | **Rank #216** 🏆 | `66361edeab434645` | **PASSED** (9/9) |
+| **`muse_bf16_proj`** | 4,830.8 µs | **3,208.6 µs** | **`1.5056x`** | **Rank #206** 🏆 | `c512f73af0454fa2` | **PASSED** (9/9) |
 
 ---
 
