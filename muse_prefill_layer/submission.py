@@ -139,7 +139,7 @@ MOE_SMEM_SM80 = 163 * 1024
 MOE_SMEM_SKINNY_TEST = 100 * 1024
 
 # --- Boundary ---
-BND_RECOMPUTE = True  # second boundary rebuilds the fp32 stream from the first's RMS factor
+BND_RECOMPUTE = False  # second boundary rebuilds the fp32 stream from the first's RMS factor
 BND_RC_MIN_T = 8192  # ...from this token count (below it, the stored stream is cheaper)
 BND_CUDA_MIN = 1  # token count from which the CUDA boundary kernel replaces the Triton one
 
@@ -199,10 +199,24 @@ LT_TOKENS = (753, 3012, 16384)  # token counts of the scored shapes; others use 
 POOL_SM_RESERVE = {}
 # (T, gemm) -> cuBLASLt heuristic signature (tile id, split-K, reduction,
 # custom option): a fixed pick, so prepare never races near-equal algorithms.
-LT_PIN = {(753, "router"): (33, 4, 2, 3), (16384, "o"): (201, 1, 0, 2),
-          (16384, "unpooler"): (201, 1, 0, 2), (16384, "pooler"): (29, 1, 0, 1)}
+LT_PIN = {
+    (753, "qkv"): (165, 1, 0, 2),
+    (753, "o"): (495, 1, 0, 7),
+    (753, "router"): (33, 4, 2, 3),
+    (753, "pooler"): (495, 1, 0, 7),
+    (3012, "qkv"): (496, 1, 0, 7),
+    (3012, "o"): (501, 1, 0, 7),
+    (3012, "router"): (402, 1, 0, 3),
+    (3012, "pooler"): (24, 1, 0, 7),
+    (3012, "unpooler"): (501, 1, 0, 7),
+    (16384, "qkv"): (24, 1, 0, 7),
+    (16384, "o"): (201, 1, 0, 2),
+    (16384, "router"): (24, 1, 0, 7),
+    (16384, "pooler"): (29, 1, 0, 1),
+    (16384, "unpooler"): (201, 1, 0, 2),
+}
 LT_ALGO_TOL = 2e-2  # a tuned algorithm must match torch.mm this closely to be kept
-LT_MIN_SPEEDUP = 0.97  # ...and must beat torch.mm by at least this factor to be kept
+LT_MIN_SPEEDUP = 1.0  # ...and must beat torch.mm by at least this factor to be kept
 LT_WORKSPACE_BYTES = 64 << 20  # cuBLASLt workspace per stream (main + side)
 
 # --- Self-tests (check runs only, printed from prepare) ---
