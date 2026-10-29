@@ -94,9 +94,15 @@ DEFAULT_MOE = "agent"
 TUNE_MARGIN = 0.95
 # Dense picks pinned to the winners measured in the whole layer: the isolated
 # tuner sometimes gets them wrong because it cannot see PDL overlap in the chain.
-PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp", (32, "pr"): "bfp",
-            (128, "qkv"): True, (256, "qkv"): True}
-FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boundary/router kernels
+PIN_PICK = {
+    (1, "qkv"): "bfp", (8, "qkv"): "bfp", (16, "qkv"): "bfp", (32, "qkv"): "bfp",
+    (1, "o"): "bfp", (8, "o"): "bfp", (16, "o"): "bfp", (32, "o"): "bfp",
+    (1, "un"): "bfp", (8, "un"): "bfp", (16, "un"): "bfp", (32, "un"): "bfp",
+    (1, "pr"): "bfpf", (8, "pr"): "bfpf", (16, "pr"): "bfpf", (32, "pr"): "bfpf",
+    (128, "qkv"): True, (256, "qkv"): True,
+}
+FORCE_GLUEV2 = None
+_TUNE_LOG = True
 
 
 # ---------------------------------------------------------------------------
