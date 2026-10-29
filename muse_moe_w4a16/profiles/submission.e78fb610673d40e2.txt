@@ -1,0 +1,67 @@
+okc run e78fb610673d40e2 on muse_moe_w4a16
+submission  /home/kuroko/okc-workspace/muse_moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     1.8930093986847585
+speedup_ci  [1.864614257704487 1.9214045396650297]
+score_us    7104.296475941359
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               76.86      35.14   2.188x      11.42  
+bs=16 load=decode 16 sharding=ep8                            187.86     106.14   1.770x      52.52  
+bs=32 load=decode 32 sharding=ep8                            206.56     139.09   1.485x      70.76  
+bs=8 load=verify 1 sharding=ep8                              142.61      82.63   1.726x      37.32  
+bs=128 load=verify 16 sharding=ep8                           459.34     213.77   2.149x     101.34  
+bs=256 load=verify 32 sharding=ep8                           625.90     290.03   2.158x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+_w13_silu                                                         17.2 µs  53.5%      1
+_w2_ks                                                             8.9 µs  27.9%      1
+_wsum_ks                                                           4.4 µs  13.9%      1
+_d1_reduce                                                         1.5 µs   4.7%      1
+total                                                             32.0 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+_w2                                                              103.6 µs  93.3%      2
+_route                                                             2.6 µs   2.3%      1
+_pe_combine_kernel                                                 2.4 µs   2.2%      1
+_pe_rstd_kernel                                                    2.4 µs   2.2%      1
+total                                                            111.0 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+_w2                                                              113.4 µs  94.0%      2
+_route                                                             2.6 µs   2.2%      1
+_pe_rstd_kernel                                                    2.5 µs   2.1%      1
+_pe_combine_kernel                                                 2.1 µs   1.8%      1
+total                                                            120.7 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+_w13_silu                                                         47.7 µs  58.4%      1
+_w2                                                               27.5 µs  33.7%      1
+_route                                                             2.3 µs   2.8%      1
+_pe_rstd_kernel                                                    2.2 µs   2.7%      1
+_pe_combine_kernel                                                 1.9 µs   2.3%      1
+total                                                             81.6 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+_w13_mix                                                         118.1 µs  62.1%      1
+_w2_mix                                                           64.6 µs  34.0%      1
+_pe_combine_kernel                                                 2.6 µs   1.3%      1
+_pe_rstd_kernel                                                    2.4 µs   1.3%      1
+_route2_mc                                                         2.4 µs   1.2%      1
+total                                                            190.1 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+_w13_mix                                                         164.4 µs  60.4%      1
+_w2_mix                                                           99.3 µs  36.5%      1
+_post_expert_norm_weighted_sum_kernel                              5.2 µs   1.9%      1
+_route2_mc                                                         3.4 µs   1.2%      1
+total                                                            272.3 µs

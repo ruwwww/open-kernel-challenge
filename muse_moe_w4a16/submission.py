@@ -92,7 +92,7 @@ D1_W13_SPLIT = 2  # K split of the decode-1 W13 (partials reduced by _d1_reduce)
 D1_W2_KS = 4  # K split of the decode-1 W2
 PF_MAX_M = 1  # weight prefetch (register double buffer) at decode 1 only
 IL_MIN_M = 128  # interleaved code+scale blocks from this many tokens ...
-IL_M = (8,)  # ... and at these token counts
+IL_M = (8, 16, 32)  # ... and at these token counts
 GU_M = (16, 32)  # token counts whose W13 uses the gate/up-paired copy
 SMB_MIN_M = 128  # shared-B path (wgmma on sm_90, mma_v2 elsewhere, which checks its data path) from this many tokens
 # The shared-B path is off. From SMB_MIN_M tokens both GEMMs run the register path (shared X
